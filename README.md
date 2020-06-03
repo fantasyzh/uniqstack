@@ -1,0 +1,2 @@
+# uniqstack
+pstack | uniq
