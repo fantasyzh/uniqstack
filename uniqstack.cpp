@@ -1,10 +1,11 @@
 // build command:
-// g++ -o uniqstack --std=gnu++11 -g uniqstack.cpp -I$libunwind_path/usr/local/include/ -L$libunwind_path/usr/local/lib -Wl,-Bstatic  -lunwind-ptrace  -lunwind-x86_64 -lunwind -lunwind-ptrace -Wl,-Bdynamic
+// g++ -o uniqstack --std=gnu++11 -g uniqstack.cpp -pthread -I$libunwind_path/usr/local/include/ -L$libunwind_path/usr/local/lib -Wl,-Bstatic  -lunwind-ptrace  -lunwind-x86_64 -lunwind -lunwind-ptrace -Wl,-Bdynamic
 #include <libunwind.h>
 #include <libunwind-ptrace.h>
 #include <cxxabi.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,8 +16,21 @@
 #include <vector>
 #include <fstream>
 #include <sstream>
+#include <thread>
+#include <mutex>
 
 using namespace std;
+
+std::mutex cacheLock;
+map<long, string> symbolCache;
+
+// for profiling
+long get_timestamp_us()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return ts.tv_sec*1000000 + ts.tv_nsec/1000;
+}
 
 void get_proc_maps(pid_t pid, vector<pair<pair<long, long>, string> >& proc_maps)
 {
@@ -57,14 +71,14 @@ void get_proc_maps(pid_t pid, vector<pair<pair<long, long>, string> >& proc_maps
     ifs.close();
 }
 
-bool get_file_offset_from_maps(long ip, const vector<pair<pair<long, long>, string> >& proc_maps, string& file, long& offset, bool& is_binary)
+bool get_file_offset_from_maps(long ip, const vector<pair<pair<long, long>, string> >& proc_maps, string& file, long& offset)
 {
     for (auto& mapping : proc_maps)
     {
         if (ip >= mapping.first.first && ip <= mapping.first.second)
         {
             file = mapping.second;
-            is_binary = mapping.first.first == 0x400000;
+            bool is_binary = mapping.first.first == 0x400000;
             offset = is_binary? ip : ip - mapping.first.first;
             return true;
         }
@@ -72,23 +86,62 @@ bool get_file_offset_from_maps(long ip, const vector<pair<pair<long, long>, stri
     return false;
 }
 
-string get_symbol_from_file_offset(string file, long offset, bool is_binary)
+vector<string> get_symbol_from_file_offset(string file, vector<long> offsets)
 {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "addr2line -p -f -C -e %s %s 0x%lx", file.c_str(), ""/*is_binary? "" : "-j .text"*/, offset);
+    char cmd[4096];
+    int n = snprintf(cmd, sizeof(cmd), "addr2line -p -i -f -C -e %s", file.c_str());
+    for (long offset : offsets)
+    {
+        n += snprintf(cmd+n, sizeof(cmd)-n, " 0x%lx", offset);
+    }
     //fprintf(stderr, "addr2line cmd: %s\n", cmd);
     FILE *fp = popen(cmd, "r");
     if (!fp)
     {
-        return "<addr2line error>";
+        fprintf(stderr, "addr2line error\n");
+        exit(1);
     }
-    vector<char> output(512);
-    fgets(output.data(), output.size(), fp);
+    vector<string> ret;
+    vector<char> output(4096);
+    const string INLINE_PREFIX = " (inlined by) ";
+    int offsetIdx = 0;
+    while (fgets(output.data(), output.size(), fp))
+    {
+        //fprintf(stderr, "%d %s", offsetIdx, output.data());
+        int len = strlen(output.data()) - 1; //strip \n
+        string symbol(output.data(), len);
+        if (strncmp(output.data(), INLINE_PREFIX.c_str(), INLINE_PREFIX.length()) == 0)
+        {
+            symbol = symbol.substr(INLINE_PREFIX.length());
+            ret.back() = symbol;
+        }
+        else
+        {
+            if (!ret.empty())
+            {
+                vector<char> extrabuf(4096);
+                snprintf(extrabuf.data(), extrabuf.size(), " %s+0x%lx", file.c_str(), offsets[offsetIdx]);
+                ret.back() += string(extrabuf.data());
+                offsetIdx += 1;
+            }
+            ret.push_back(symbol);
+        }
+    }
     fclose(fp);
-    string symbol(output.data());
-    if (symbol[symbol.size() - 1] = '\n') symbol.resize(symbol.size() - 1);
+    if (!ret.empty())
+    {
+        char extrabuf[512];
+        snprintf(extrabuf, sizeof(extrabuf), " %s+0x%lx", file.c_str(), offsets[offsetIdx]);
+        ret.back() += string(extrabuf);
+        offsetIdx += 1;
+    }
+    if (offsetIdx != offsets.size())
+    {
+        fprintf(stderr, "addr2line not enough output lines, idx: %d, offsets: %d\n", offsetIdx, offsets.size());
+        exit(1);
+    }
 
-    return symbol;
+    return ret;
 }
 
 pid_t ptrace_attach(pid_t pid)
@@ -120,15 +173,13 @@ pid_t ptrace_attach(pid_t pid)
     }
 }
 
-bool get_backtrace(pid_t pid, vector<pair<long, string> >& stack)
+bool get_backtrace(pid_t pid, vector<long>& stack, map<long, string>& symbolCache, std::mutex& cacheLock)
 {
     bool ok = false;
     unw_cursor_t cursor;
     unw_word_t ip, sp;
 
     unw_addr_space_t addrspace = unw_create_addr_space(&_UPT_accessors, 0);
-
-    //ptrace_attach(pid);
 
     do
     {
@@ -154,22 +205,38 @@ bool get_backtrace(pid_t pid, vector<pair<long, string> >& stack)
             break;
         }
 
-        //printf("Thread %d\n", pid); 
         while (unw_step(&cursor) > 0) {
             unw_get_reg(&cursor, UNW_REG_IP, &ip);
             //unw_get_reg(&cursor, UNW_REG_SP, &sp);
-            string procname = "??";
-            //char buf[256];
-            //unw_word_t procoff;
-            //unw_get_proc_name(&cursor, buf, sizeof(buf), &procoff);
-            //size_t buf2len = 256;
-            //char *buf2 = (char*)malloc(buf2len);
-            //int status;
-            //buf2 = abi::__cxa_demangle(buf, buf2, &buf2len, &status);
-            //procname = buf2? buf2 : procname;
-            //free(buf2);
-            //printf("0x%lx %s\n", ip, procname.c_str()); 
-            stack.push_back(make_pair(ip, procname));
+            stack.push_back(ip);
+            cacheLock.lock();
+            bool newIp = (symbolCache.find(ip) == symbolCache.end());
+            cacheLock.unlock();
+            if (newIp)
+            {
+                char buf[512];
+                unw_word_t procoff;
+                int err = unw_get_proc_name(&cursor, buf, sizeof(buf), &procoff);
+
+                if (err)
+                {
+                    //fprintf(stderr, "unw_get_proc_name errorCode: %d ip:%lx\n", err, ip);
+                    cacheLock.lock();
+                    symbolCache[ip] = string();
+                    cacheLock.unlock();
+                }
+                else
+                {
+                    size_t buf2len = 512;
+                    char *buf2 = (char*)malloc(buf2len);
+                    int status;
+                    buf2 = abi::__cxa_demangle(buf, buf2, &buf2len, &status);
+                    cacheLock.lock();
+                    symbolCache[ip] = buf2? buf2 : buf;
+                    cacheLock.unlock();
+                    free(buf2);
+                }
+            }
         }
         ok = true;
         //_UPT_resume(addrspace, &cursor, arg);
@@ -184,23 +251,32 @@ bool get_backtrace(pid_t pid, vector<pair<long, string> >& stack)
     return ok;
 }
 
+void Usage()
+{
+    fprintf(stderr, "Usage: unistack <pid> [<tid> ...]\n");
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2)
     {
-        fprintf(stderr, "Usage: unistack <pid> [<tid> ...]\n");
+        Usage();
         return 1;
     }
 
-    int pid = atoi(argv[1]);
+    int optind = 1;
+
+    int pid = atoi(argv[optind]);
     if (pid <= 0)
     {
         fprintf(stderr, "Invalid pid '%d'\n", pid);
         return 1;
     }
 
+    optind++;
+
     std::set<int> tids;
-    for (int i = 2; i < argc; i++)
+    for (int i = optind; i < argc; i++)
     {
         int tid = atoi(argv[i]);
         if (tid <= 0)
@@ -231,7 +307,7 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    map<int, vector<pair<long, string> > > stacks;
+    map<int, vector<long> > stacks;
 
     vector<int> threads;
     while (1)
@@ -276,35 +352,110 @@ int main(int argc, char **argv)
 
     time_t ptrace_start = time(NULL);
 
-    for (size_t i = 0; i < threads.size(); i++)
+    struct ThreadWork
     {
-        int tpid = threads[i];
-        threads[i] = ptrace_attach(tpid);
-    }
+        std::thread t;
+        vector<int> threadsLocal;
+        map<int, vector<long> > stacksLocal;
 
+        void run()
+        {
+            for (size_t i = 0; i < threadsLocal.size(); i++)
+            {
+                int tpid = threadsLocal[i];
+                threadsLocal[i] = ptrace_attach(tpid);
+            }
+            for (size_t i = 0; i < threadsLocal.size(); i++)
+            {
+                int tpid = threadsLocal[i];
+
+                if (tpid == 0) continue; // thread not exist
+
+                vector<long> stack;
+                if (get_backtrace(tpid, stack, symbolCache, cacheLock))
+                {
+                    stacksLocal[tpid] = stack;
+                }
+            }
+        }
+    };
+
+    int NUM_THREADS = threads.size()/100 + 1;
+    vector<ThreadWork> workers(NUM_THREADS);
     for (size_t i = 0; i < threads.size(); i++)
     {
         int tpid = threads[i];
 
         if (tpid == 0) continue; // thread not exist
-
-        vector<pair<long, string> > stack;
-        if (get_backtrace(tpid, stack))
+        int idx = i % NUM_THREADS;
+        workers[idx].threadsLocal.push_back(tpid);
+    }
+    if (NUM_THREADS == 1)
+    {
+        workers[0].run();
+        stacks = std::move(workers[0].stacksLocal);
+    }
+    else
+    {
+        for (int i = 0; i < NUM_THREADS; i++)
         {
-            stacks[tpid] = stack;
+            workers[i].t = std::thread(&ThreadWork::run, &workers[i]);
         }
+        for (int i = 0; i < NUM_THREADS; i++)
+        {
+            workers[i].t.join();
+            stacks.insert(workers[i].stacksLocal.begin(), workers[i].stacksLocal.end());
+         }
     }
 
     fprintf(stderr, "Finish ptrace %d threads in %d seconds.\n", threads.size(), time(NULL)-ptrace_start);
 
+    set<long> ips;
+
     // do unique: group pids by stack
-    map<vector<pair<long, string> >, vector<int> > stack2pids;
+    map<vector<long>, vector<int> > stack2pids;
     for (auto& t : stacks)
     {
         stack2pids[t.second].push_back(t.first);
+
+        for (auto& ip: t.second)
+        {
+            ips.insert(ip);
+        }
     }
 
-    map<long, string> symbolCache;
+    map<string, pair<vector<long>, vector<long> > > file2ips; // <ips, offsets>
+
+    for (auto& ip : ips)
+    {
+        string file;
+        long offset;
+        if (get_file_offset_from_maps(ip, proc_maps, file, offset))
+        {
+            if (!symbolCache[ip].empty())
+            {
+                if (symbolCache[ip].empty()) symbolCache[ip] = "??";
+
+                char extrabuf[512];
+                snprintf(extrabuf, sizeof(extrabuf), " %s+0x%lx", file.c_str(), offset);
+                symbolCache[ip] += extrabuf;
+            }
+            else
+            {
+                file2ips[file].first.push_back(ip);
+                file2ips[file].second.push_back(offset);
+            }
+        }
+    }
+    for (auto& file2ipsItem : file2ips)
+    {
+        vector<string> symbols = get_symbol_from_file_offset(file2ipsItem.first, file2ipsItem.second.second);
+        for (size_t i = 0; i < symbols.size(); i++)
+        {
+            //fprintf(stderr, "get symbol: %s 0x%lx\n", symbols[i].c_str(), file2ipsItem.second.first[i]);
+            symbolCache[file2ipsItem.second.first[i]] = symbols[i];
+        }
+    }
 
     for (auto& s : stack2pids)
     {
@@ -333,25 +484,14 @@ int main(int argc, char **argv)
         int idx = 0;
         for (auto& ip : s.first)
         {
-            string symbol = "<unknown symbol>";
-            string file;
-            long offset;
-            bool is_binary;
+            string symbol = symbolCache[ip];
 
-            if (symbolCache.find(ip.first) != symbolCache.end())
+            if (symbol.empty())
             {
-                symbol = symbolCache[ip.first];
-            }
-            else
-            {
-                if (get_file_offset_from_maps(ip.first, proc_maps, file, offset, is_binary))
-                {
-                    symbol = get_symbol_from_file_offset(file, offset, is_binary);
-                    symbolCache[ip.first] = symbol;
-                }
+                symbol = "??";
             }
 
-            printf("#%d 0x%lx %s %s+0x%lx\n", idx, ip.first, symbol.c_str(), file.c_str(), offset);
+            printf("#%d 0x%lx %s\n", idx, ip, symbol.c_str());
             idx++;
         }
     }
