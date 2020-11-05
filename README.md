@@ -1,2 +1,3 @@
 # uniqstack
-pstack | uniq
+
+fast pstack + uniqstack for linux
