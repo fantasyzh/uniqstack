@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <dirent.h>
 #include <string.h>
+#include <unistd.h>
 #include <map>
 #include <set>
 #include <vector>
@@ -18,6 +19,7 @@
 #include <sstream>
 #include <thread>
 #include <mutex>
+#include <algorithm>
 
 using namespace std;
 
@@ -192,7 +194,7 @@ bool get_backtrace(pid_t pid, vector<long>& stack, map<long, string>& symbolCach
         }
         if (!(WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP))
         {
-            fprintf(stderr, "waitpid stop status not SIGTRAP: %d", status);
+            fprintf(stderr, "waitpid stop status not SIGTRAP: %d\n", status);
         }
 
         void *arg = _UPT_create(pid);
@@ -380,7 +382,7 @@ int main(int argc, char **argv)
         }
     };
 
-    int NUM_THREADS = threads.size()/100 + 1;
+    int NUM_THREADS = threads.size()/50 + 1;
     vector<ThreadWork> workers(NUM_THREADS);
     for (size_t i = 0; i < threads.size(); i++)
     {
@@ -434,8 +436,6 @@ int main(int argc, char **argv)
         {
             if (!symbolCache[ip].empty())
             {
-                if (symbolCache[ip].empty()) symbolCache[ip] = "??";
-
                 char extrabuf[512];
                 snprintf(extrabuf, sizeof(extrabuf), " %s+0x%lx", file.c_str(), offset);
                 symbolCache[ip] += extrabuf;
@@ -447,17 +447,26 @@ int main(int argc, char **argv)
             }
         }
     }
-    for (auto& file2ipsItem : file2ips)
+
+    if (!file2ips.empty())
     {
-        vector<string> symbols = get_symbol_from_file_offset(file2ipsItem.first, file2ipsItem.second.second);
-        for (size_t i = 0; i < symbols.size(); i++)
+        fprintf(stderr, "To translate %d unknown addresses using addr2line\n", file2ips.size());
+        for (auto& file2ipsItem : file2ips)
         {
-            //fprintf(stderr, "get symbol: %s 0x%lx\n", symbols[i].c_str(), file2ipsItem.second.first[i]);
-            symbolCache[file2ipsItem.second.first[i]] = symbols[i];
+            vector<string> symbols = get_symbol_from_file_offset(file2ipsItem.first, file2ipsItem.second.second);
+            for (size_t i = 0; i < symbols.size(); i++)
+            {
+                //fprintf(stderr, "get symbol: %s 0x%lx\n", symbols[i].c_str(), file2ipsItem.second.first[i]);
+                symbolCache[file2ipsItem.second.first[i]] = symbols[i];
+            }
         }
     }
 
-    for (auto& s : stack2pids)
+    // order by thread number desc
+    vector<pair<vector<long>, vector<int>> > stack2pids_ordered(stack2pids.begin(), stack2pids.end());
+    std::sort(stack2pids_ordered.begin(), stack2pids_ordered.end(), [](
+                const pair<vector<long>, vector<int>>& a, const pair<vector<long>, vector<int>>& b) { return a.second.size() > b.second.size(); });
+    for (auto& s : stack2pids_ordered)
     {
         if (s.second.size() == 1)
         {
