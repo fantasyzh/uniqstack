@@ -90,6 +90,7 @@ bool get_file_offset_from_maps(long ip, const vector<pair<pair<long, long>, stri
 
 vector<string> get_symbol_from_file_offset(string file, vector<long> offsets)
 {
+    vector<string> ret;
     char cmd[4096];
     int n = snprintf(cmd, sizeof(cmd), "addr2line -p -i -f -C -e %s", file.c_str());
     for (long offset : offsets)
@@ -100,10 +101,9 @@ vector<string> get_symbol_from_file_offset(string file, vector<long> offsets)
     FILE *fp = popen(cmd, "r");
     if (!fp)
     {
-        fprintf(stderr, "addr2line error\n");
-        exit(1);
+        fprintf(stderr, "run addr2line cmd error %s\n", cmd);
+        return ret;
     }
-    vector<string> ret;
     vector<char> output(4096);
     const string INLINE_PREFIX = " (inlined by) ";
     int offsetIdx = 0;
@@ -140,7 +140,8 @@ vector<string> get_symbol_from_file_offset(string file, vector<long> offsets)
     if (offsetIdx != offsets.size())
     {
         fprintf(stderr, "addr2line not enough output lines, idx: %d, offsets: %d\n", offsetIdx, offsets.size());
-        exit(1);
+        ret.clear();
+        return ret;
     }
 
     return ret;
