@@ -23,6 +23,8 @@
 
 using namespace std;
 
+static const int kMaxBacktraceDepth = 100;
+
 std::mutex cacheLock;
 map<long, string> symbolCache;
 
@@ -183,6 +185,7 @@ bool get_backtrace(pid_t pid, vector<long>& stack, map<long, string>& symbolCach
     unw_word_t ip, sp;
 
     unw_addr_space_t addrspace = unw_create_addr_space(&_UPT_accessors, 0);
+    unw_set_caching_policy(addrspace, UNW_CACHE_GLOBAL);
 
     do
     {
@@ -208,7 +211,8 @@ bool get_backtrace(pid_t pid, vector<long>& stack, map<long, string>& symbolCach
             break;
         }
 
-        while (unw_step(&cursor) > 0) {
+        int depth = 0;
+        while (++depth <= kMaxBacktraceDepth && unw_step(&cursor) > 0) {
             unw_get_reg(&cursor, UNW_REG_IP, &ip);
             //unw_get_reg(&cursor, UNW_REG_SP, &sp);
             stack.push_back(ip);
