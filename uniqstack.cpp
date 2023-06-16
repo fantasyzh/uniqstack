@@ -2,6 +2,7 @@
 // g++ -o uniqstack --std=gnu++11 -g uniqstack.cpp -pthread -I$libunwind_path/usr/local/include/ -L$libunwind_path/usr/local/lib -Wl,-Bstatic  -lunwind-ptrace  -lunwind-x86_64 -lunwind -lunwind-ptrace -Wl,-Bdynamic
 #include <libunwind.h>
 #include <libunwind-ptrace.h>
+#include <libunwind_global_proc_maps.h>
 #include <cxxabi.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
@@ -356,6 +357,8 @@ int main(int argc, char **argv)
         // TODO  get thread status  (before or after traced?)
         // TODO  get kernel stack
     }
+
+    init_global_proc_map(pid);
 
     time_t ptrace_start = time(NULL);
 
