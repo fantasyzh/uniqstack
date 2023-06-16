@@ -358,6 +358,8 @@ int main(int argc, char **argv)
         // TODO  get kernel stack
     }
 
+    closedir(dir);
+
     init_global_proc_map(pid);
 
     time_t ptrace_start = time(NULL);
