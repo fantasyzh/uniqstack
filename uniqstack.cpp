@@ -2,6 +2,7 @@
 // g++ -o uniqstack --std=gnu++11 -g uniqstack.cpp -pthread -I$libunwind_path/usr/local/include/ -L$libunwind_path/usr/local/lib -Wl,-Bstatic  -lunwind-ptrace  -lunwind-x86_64 -lunwind -lunwind-ptrace -Wl,-Bdynamic
 #include <libunwind.h>
 #include <libunwind-ptrace.h>
+#include <libunwind_global_proc_maps.h>
 #include <cxxabi.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
@@ -22,6 +23,8 @@
 #include <algorithm>
 
 using namespace std;
+
+static const int kMaxBacktraceDepth = 100;
 
 std::mutex cacheLock;
 map<long, string> symbolCache;
@@ -90,6 +93,7 @@ bool get_file_offset_from_maps(long ip, const vector<pair<pair<long, long>, stri
 
 vector<string> get_symbol_from_file_offset(string file, vector<long> offsets)
 {
+    vector<string> ret;
     char cmd[4096];
     int n = snprintf(cmd, sizeof(cmd), "addr2line -p -i -f -C -e %s", file.c_str());
     for (long offset : offsets)
@@ -100,10 +104,9 @@ vector<string> get_symbol_from_file_offset(string file, vector<long> offsets)
     FILE *fp = popen(cmd, "r");
     if (!fp)
     {
-        fprintf(stderr, "addr2line error\n");
-        exit(1);
+        fprintf(stderr, "run addr2line cmd error %s\n", cmd);
+        return ret;
     }
-    vector<string> ret;
     vector<char> output(4096);
     const string INLINE_PREFIX = " (inlined by) ";
     int offsetIdx = 0;
@@ -140,7 +143,8 @@ vector<string> get_symbol_from_file_offset(string file, vector<long> offsets)
     if (offsetIdx != offsets.size())
     {
         fprintf(stderr, "addr2line not enough output lines, idx: %d, offsets: %d\n", offsetIdx, offsets.size());
-        exit(1);
+        ret.clear();
+        return ret;
     }
 
     return ret;
@@ -182,6 +186,7 @@ bool get_backtrace(pid_t pid, vector<long>& stack, map<long, string>& symbolCach
     unw_word_t ip, sp;
 
     unw_addr_space_t addrspace = unw_create_addr_space(&_UPT_accessors, 0);
+    unw_set_caching_policy(addrspace, UNW_CACHE_GLOBAL);
 
     do
     {
@@ -207,7 +212,8 @@ bool get_backtrace(pid_t pid, vector<long>& stack, map<long, string>& symbolCach
             break;
         }
 
-        while (unw_step(&cursor) > 0) {
+        int depth = 0;
+        while (++depth <= kMaxBacktraceDepth && unw_step(&cursor) > 0) {
             unw_get_reg(&cursor, UNW_REG_IP, &ip);
             //unw_get_reg(&cursor, UNW_REG_SP, &sp);
             stack.push_back(ip);
@@ -351,6 +357,10 @@ int main(int argc, char **argv)
         // TODO  get thread status  (before or after traced?)
         // TODO  get kernel stack
     }
+
+    closedir(dir);
+
+    init_global_proc_map(pid);
 
     time_t ptrace_start = time(NULL);
 
