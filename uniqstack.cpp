@@ -129,6 +129,11 @@ vector<string> get_symbol_from_file_offset(string file, vector<long> offsets)
                 ret.back() += string(extrabuf.data());
                 offsetIdx += 1;
             }
+
+            if (symbol.compare(symbol.length() - strlen("??:?"), strlen("??:?"), "??:?") == 0)
+            {
+                symbol = "??:0";
+            }
             ret.push_back(symbol);
         }
     }
@@ -273,6 +278,18 @@ int main(int argc, char **argv)
     }
 
     int optind = 1;
+
+    bool useAddr2line = false;
+    if (strcmp(argv[1], "--addr2line") == 0)
+    {
+        useAddr2line = true;
+        if (argc < 3)
+        {
+            Usage();
+            return 1;
+        }
+        optind += 1;
+    }
 
     int pid = atoi(argv[optind]);
     if (pid <= 0)
@@ -444,13 +461,14 @@ int main(int argc, char **argv)
         long offset;
         if (get_file_offset_from_maps(ip, proc_maps, file, offset))
         {
-            if (!symbolCache[ip].empty())
+            if (!useAddr2line && !symbolCache[ip].empty())
             {
                 char extrabuf[512];
                 snprintf(extrabuf, sizeof(extrabuf), " %s+0x%lx", file.c_str(), offset);
                 symbolCache[ip] += extrabuf;
             }
-            else
+
+            if (useAddr2line)
             {
                 file2ips[file].first.push_back(ip);
                 file2ips[file].second.push_back(offset);
@@ -458,16 +476,24 @@ int main(int argc, char **argv)
         }
     }
 
-    if (!file2ips.empty())
+    if (useAddr2line && !file2ips.empty())
     {
-        fprintf(stderr, "To translate %d unknown addresses using addr2line\n", file2ips.size());
+        fprintf(stderr, "To translate %d file's addresses using addr2line\n", file2ips.size());
         for (auto& file2ipsItem : file2ips)
         {
             vector<string> symbols = get_symbol_from_file_offset(file2ipsItem.first, file2ipsItem.second.second);
             for (size_t i = 0; i < symbols.size(); i++)
             {
                 //fprintf(stderr, "get symbol: %s 0x%lx\n", symbols[i].c_str(), file2ipsItem.second.first[i]);
-                symbolCache[file2ipsItem.second.first[i]] = symbols[i];
+                long ip = file2ipsItem.second.first[i];
+                if (!symbolCache[ip].empty())
+                {
+                    symbolCache[ip] = string("[") + symbolCache[ip] + "] " + symbols[i];
+                }
+                else
+                {
+                    symbolCache[ip] = symbols[i];
+                }
             }
         }
     }
