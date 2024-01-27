@@ -1,5 +1,5 @@
 // build command:
-// g++ -o uniqstack --std=gnu++11 -g uniqstack.cpp -pthread -I$libunwind_path/usr/local/include/ -L$libunwind_path/usr/local/lib -Wl,-Bstatic  -lunwind-ptrace  -lunwind-x86_64 -lunwind -lunwind-ptrace -Wl,-Bdynamic
+// g++ -o uniqstack --std=gnu++11 -g uniqstack.cpp -pthread -I$libunwind_path/include/ -L$libunwind_path/lib -Wl,-Bstatic  -lunwind-ptrace  -lunwind-x86_64 -lunwind -Wl,-Bdynamic
 #include <libunwind.h>
 #include <libunwind-ptrace.h>
 #include <libunwind_global_proc_maps.h>
@@ -37,7 +37,16 @@ long get_timestamp_us()
     return ts.tv_sec*1000000 + ts.tv_nsec/1000;
 }
 
-void get_proc_maps(pid_t pid, vector<pair<pair<long, long>, string> >& proc_maps)
+struct ProcMapEntry
+{
+    long addr_begin;
+    long addr_end;
+    long addr_begin_offset;
+    string file;
+};
+typedef vector<ProcMapEntry> ProcMaps;
+
+void get_proc_maps(pid_t pid, ProcMaps& proc_maps)
 {
     char proc_maps_path[32];
     snprintf(proc_maps_path, sizeof(proc_maps_path), "/proc/%d/maps", pid);
@@ -46,29 +55,30 @@ void get_proc_maps(pid_t pid, vector<pair<pair<long, long>, string> >& proc_maps
 
     while (ifs)
     {
-        long addr_begin, addr_end;
-        string file;
+        ProcMapEntry entry;
         string addr_range;
         string perms;
+        string offset;
         string ignore;
 
         string line;
         std::getline(ifs, line);
 
         stringstream ss(line);
-        ss >> addr_range >> perms >> ignore >> ignore >> ignore;
+        ss >> addr_range >> perms >> offset >> ignore >> ignore;
         if (perms == "r-xp")
         {
-            ss >> file;
+            ss >> entry.file;
         }
         else
         {
             continue;
         }
         size_t pos = addr_range.find('-');
-        addr_begin = strtoul(addr_range.substr(0, pos).c_str(), NULL, 16);
-        addr_end = strtoul(addr_range.substr(pos + 1).c_str(), NULL, 16);
-        proc_maps.push_back(make_pair(make_pair(addr_begin, addr_end), file));
+        entry.addr_begin = strtoul(addr_range.substr(0, pos).c_str(), NULL, 16);
+        entry.addr_end = strtoul(addr_range.substr(pos + 1).c_str(), NULL, 16);
+        entry.addr_begin_offset = strtoul(offset.c_str(), NULL, 16);
+        proc_maps.push_back(entry);
 
         //fprintf(stderr, "%lx - %lx %s\n", addr_begin, addr_end, file.c_str());
     }
@@ -76,15 +86,15 @@ void get_proc_maps(pid_t pid, vector<pair<pair<long, long>, string> >& proc_maps
     ifs.close();
 }
 
-bool get_file_offset_from_maps(long ip, const vector<pair<pair<long, long>, string> >& proc_maps, string& file, long& offset)
+bool get_file_offset_from_maps(long ip, const ProcMaps& proc_maps, string& file, long& offset)
 {
     for (auto& mapping : proc_maps)
     {
-        if (ip >= mapping.first.first && ip <= mapping.first.second)
+        if (ip >= mapping.addr_begin && ip <= mapping.addr_end)
         {
-            file = mapping.second;
-            bool is_binary = mapping.first.first == 0x400000;
-            offset = is_binary? ip : ip - mapping.first.first;
+            file = mapping.file;
+            bool is_binary = mapping.addr_begin == 0x400000;
+            offset = is_binary? ip : ip - mapping.addr_begin + mapping.addr_begin_offset;
             return true;
         }
     }
@@ -112,7 +122,7 @@ vector<string> get_symbol_from_file_offset(string file, vector<long> offsets)
     int offsetIdx = 0;
     while (fgets(output.data(), output.size(), fp))
     {
-        //fprintf(stderr, "%d %s", offsetIdx, output.data());
+        //fprintf(stderr, "%d %s\n", offsetIdx, output.data());
         int len = strlen(output.data()) - 1; //strip \n
         string symbol(output.data(), len);
         if (strncmp(output.data(), INLINE_PREFIX.c_str(), INLINE_PREFIX.length()) == 0)
@@ -128,6 +138,12 @@ vector<string> get_symbol_from_file_offset(string file, vector<long> offsets)
                 snprintf(extrabuf.data(), extrabuf.size(), " %s+0x%lx", file.c_str(), offsets[offsetIdx]);
                 ret.back() += string(extrabuf.data());
                 offsetIdx += 1;
+            }
+
+            // may give invalid function name
+            if (symbol.compare(symbol.length() - 4, 4, "??:?") == 0)
+            {
+                symbol = "??:0";
             }
             ret.push_back(symbol);
         }
@@ -274,6 +290,18 @@ int main(int argc, char **argv)
 
     int optind = 1;
 
+    bool useAddr2line = false;
+    if (strcmp(argv[1], "--addr2line") == 0)
+    {
+        useAddr2line = true;
+        if (argc < 3)
+        {
+            Usage();
+            return 1;
+        }
+        optind += 1;
+    }
+
     int pid = atoi(argv[optind]);
     if (pid <= 0)
     {
@@ -296,7 +324,7 @@ int main(int argc, char **argv)
     }
 
     // get proc maps
-    vector<pair<pair<long, long>, string> > proc_maps;
+    ProcMaps proc_maps;
     get_proc_maps(pid, proc_maps);
 
     if (proc_maps.empty())
@@ -362,7 +390,7 @@ int main(int argc, char **argv)
 
     init_global_proc_map(pid);
 
-    time_t ptrace_start = time(NULL);
+    long ptrace_start_us = get_timestamp_us();
 
     struct ThreadWork
     {
@@ -420,7 +448,7 @@ int main(int argc, char **argv)
          }
     }
 
-    fprintf(stderr, "Finish ptrace %d threads in %d seconds.\n", threads.size(), time(NULL)-ptrace_start);
+    fprintf(stderr, "Finish ptrace %d threads in %d ms.\n", threads.size(), (get_timestamp_us()-ptrace_start_us)/1000);
 
     set<long> ips;
 
@@ -444,13 +472,14 @@ int main(int argc, char **argv)
         long offset;
         if (get_file_offset_from_maps(ip, proc_maps, file, offset))
         {
-            if (!symbolCache[ip].empty())
+            if (!useAddr2line && !symbolCache[ip].empty())
             {
                 char extrabuf[512];
                 snprintf(extrabuf, sizeof(extrabuf), " %s+0x%lx", file.c_str(), offset);
                 symbolCache[ip] += extrabuf;
             }
-            else
+
+            if (useAddr2line)
             {
                 file2ips[file].first.push_back(ip);
                 file2ips[file].second.push_back(offset);
@@ -458,16 +487,25 @@ int main(int argc, char **argv)
         }
     }
 
-    if (!file2ips.empty())
+    if (useAddr2line && !file2ips.empty())
     {
-        fprintf(stderr, "To translate %d unknown addresses using addr2line\n", file2ips.size());
+        fprintf(stderr, "To translate %d file's addresses using addr2line\n", file2ips.size());
         for (auto& file2ipsItem : file2ips)
         {
             vector<string> symbols = get_symbol_from_file_offset(file2ipsItem.first, file2ipsItem.second.second);
             for (size_t i = 0; i < symbols.size(); i++)
             {
                 //fprintf(stderr, "get symbol: %s 0x%lx\n", symbols[i].c_str(), file2ipsItem.second.first[i]);
-                symbolCache[file2ipsItem.second.first[i]] = symbols[i];
+                long ip = file2ipsItem.second.first[i];
+                bool noSymbol = symbols[i].compare(0, 3, "??:") == 0;
+                if (noSymbol && !symbolCache[ip].empty())
+                {
+                    symbolCache[ip] = string("[") + symbolCache[ip] + "] " + symbols[i];
+                }
+                else
+                {
+                    symbolCache[ip] = symbols[i];
+                }
             }
         }
     }
