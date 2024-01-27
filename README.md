@@ -6,7 +6,10 @@ fast pstack + uniqstack for linux, use libunwind.
 
 ## libunwind
 
-for static linking, need download source from https://www.nongnu.org/libunwind/download.html , and build from source.
+for static linking, clone https://github.com/libunwind/libunwind, and build from source.
+
+However, to avoid repeatedly read proc maps in multi-thread process, used a hack `init_global_proc_map` from
+https://github.com/fantasyzh/libunwind  fork repo.
 
 ## compile
 
